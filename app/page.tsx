@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 
 interface HandTrackPrediction {
   label: string
@@ -34,61 +34,80 @@ export default function HandTrackDemo() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const drawCanvasRef = useRef<HTMLCanvasElement>(null)
+  const drawCtxRef = useRef<CanvasRenderingContext2D | null>(null)
+  const lastPointRef = useRef<{x: number, y: number} | null>(null)
+  const detectionTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const gestureStateRef = useRef<{
+    lastGesture: string;
+    gestureStartTime: number;
+    gestureConfidence: number;
+  }>({ lastGesture: 'none', gestureStartTime: 0, gestureConfidence: 0 })
 
   const [model, setModel] = useState<HandTrackModel | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [color, setColor] = useState('#ff0000')
-  const [lastX, setLastX] = useState(0)
-  const [lastY, setLastY] = useState(0)
   const [handTrackLoaded, setHandTrackLoaded] = useState(false)
   const [cameraStatus, setCameraStatus] = useState('Not started')
-  const [detectionLog, setDetectionLog] = useState<string[]>([])
+  const [detectionRunning, setDetectionRunning] = useState(false)
+  const [fps, setFps] = useState(0)
+  const [isDrawing, setIsDrawing] = useState(false)
 
   const MODEL_PARAMS = {
     flipHorizontal: true,
-    maxNumBoxes: 5,
-    iouThreshold: 0.5,
-    scoreThreshold: 0.2, // Lowered from 0.3 for better detection
+    maxNumBoxes: 1, // Reduced to 1 for better performance
+    iouThreshold: 0.6,
+    scoreThreshold: 0.6, // Higher threshold for more stable detection
   }
 
-  // Add log function
-  const addLog = (message: string) => {
-    setDetectionLog(prev => [...prev.slice(-9), `${new Date().toLocaleTimeString()}: ${message}`])
-  }
-
-  // Load HandTrack script manually
+  // Load HandTrack script
   useEffect(() => {
     if (typeof window !== 'undefined' && !window.handTrack) {
       const script = document.createElement('script')
       script.src = 'https://cdn.jsdelivr.net/npm/handtrackjs/dist/handtrack.min.js'
-      script.onload = () => {
-        setHandTrackLoaded(true)
-        addLog('HandTrack.js loaded successfully')
-      }
-      script.onerror = () => {
-        setError('Failed to load HandTrack.js')
-        addLog('Failed to load HandTrack.js')
-      }
+      script.onload = () => setHandTrackLoaded(true)
+      script.onerror = () => setError('Failed to load HandTrack.js')
       document.head.appendChild(script)
     } else if (window.handTrack) {
       setHandTrackLoaded(true)
-      addLog('HandTrack.js already loaded')
+    }
+    
+    return () => {
+      if (detectionTimeoutRef.current) {
+        clearTimeout(detectionTimeoutRef.current)
+      }
     }
   }, [])
 
-  // ──────────────────────── 1.webcam & load model ─────────────────────────────
-  const start = async () => {
+  // Initialize drawing canvas
+  useEffect(() => {
+    if (drawCanvasRef.current) {
+      const ctx = drawCanvasRef.current.getContext('2d')
+      if (ctx) {
+        drawCtxRef.current = ctx
+        ctx.lineWidth = 8
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+        ctx.strokeStyle = color
+        ctx.fillStyle = color
+        // Set canvas size
+        drawCanvasRef.current.width = drawCanvasRef.current.offsetWidth
+        drawCanvasRef.current.height = drawCanvasRef.current.offsetHeight
+      }
+    }
+  }, [color])
+
+  // Start camera and load model
+  const start = useCallback(async () => {
     if (!videoRef.current) {
       setError('Video element not found')
-      addLog('Error: Video element not found')
       return
     }
 
+    const video = videoRef.current
     const ht = window.handTrack
     if (!ht) {
       setError('HandTrack.js not loaded')
-      addLog('Error: HandTrack.js not loaded')
       return
     }
 
@@ -96,288 +115,308 @@ export default function HandTrackDemo() {
       setIsLoading(true)
       setError(null)
       setCameraStatus('Starting...')
-      addLog('Starting camera...')
 
-      const okay = await ht.startVideo(videoRef.current)
-      addLog(`Camera start result: ${okay}`)
+      // Stop any existing stream
+      if (video.srcObject) {
+        const stream = video.srcObject as MediaStream
+        stream.getTracks().forEach(track => track.stop())
+        video.srcObject = null
+      }
+
+      const okay = await ht.startVideo(video)
       
       if (!okay) {
         setError('Camera denied or not found')
         setCameraStatus('Failed')
-        addLog('Camera access denied or not found')
         return
       }
 
       setCameraStatus('Camera started')
-      addLog('Camera started successfully')
 
-      // Wait a bit for video to initialize
-      await new Promise(resolve => setTimeout(resolve, 1000))
+      // Wait for video to be ready
+      await new Promise<void>((resolve, reject) => {
+        const onLoadedMetadata = () => {
+          video.removeEventListener('loadedmetadata', onLoadedMetadata)
+          resolve()
+        }
+        
+        video.addEventListener('loadedmetadata', onLoadedMetadata)
+        
+        if (video.readyState >= 1) {
+          resolve()
+        }
+        
+        setTimeout(() => reject(new Error('Video timeout')), 5000)
+      })
 
       if (!model) {
-        addLog('Loading HandTrack model...')
+        setCameraStatus('Loading model...')
         const loaded = await ht.load(MODEL_PARAMS)
         setModel(loaded)
-        addLog('HandTrack model loaded successfully')
-        setCameraStatus('Ready')
       }
+      
+      setCameraStatus('Ready')
+      setDetectionRunning(true)
     } catch (err) {
       console.error('Initialization error:', err)
-      const errorMsg = `Failed to initialize: ${err instanceof Error ? err.message : 'Unknown error'}`
-      setError(errorMsg)
-      addLog(`Error: ${errorMsg}`)
+      setError(`Failed to initialize: ${err instanceof Error ? err.message : 'Unknown error'}`)
       setCameraStatus('Failed')
+      setModel(null)
     } finally {
       setIsLoading(false)
     }
-  }
+  }, [model])
 
-  // Manual camera restart function
-  const restartCamera = async () => {
-    const video = videoRef.current
-    if (!video) return
-
-    try {
-      addLog('Restarting camera...')
-      setCameraStatus('Restarting...')
-      
-      // Stop existing stream
-      const stream = video.srcObject as MediaStream | null
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop())
-      }
-
-      // Request new camera access
-      const newStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { 
-          width: { ideal: 640 }, 
-          height: { ideal: 480 } 
-        } 
-      })
-      
-      video.srcObject = newStream
-      video.play()
-      
-      setCameraStatus('Camera restarted')
-      addLog('Camera restarted successfully')
-    } catch (err) {
-      console.error('Camera restart failed:', err)
-      setError('Failed to restart camera')
-      setCameraStatus('Failed')
-      addLog('Camera restart failed')
+  // Clear drawing canvas
+  const clearCanvas = useCallback(() => {
+    if (drawCanvasRef.current && drawCtxRef.current) {
+      drawCtxRef.current.clearRect(0, 0, drawCanvasRef.current.width, drawCanvasRef.current.height)
     }
-  }
+    lastPointRef.current = null
+    setIsDrawing(false)
+  }, [])
 
-  // ───────── Drawing helper ───────── 
-  const resetStroke = () => { 
-    setLastX(0)
-    setLastY(0)
-  }
-  
-  const rndColor = () => '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0')
+  // Change drawing color
+  const changeColor = useCallback(() => {
+    const colors = ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ff00ff', '#00ffff', '#ffffff', '#ffa500']
+    const currentIndex = colors.indexOf(color)
+    const nextColor = colors[(currentIndex + 1) % colors.length]
+    setColor(nextColor)
+    if (drawCtxRef.current) {
+      drawCtxRef.current.strokeStyle = nextColor
+      drawCtxRef.current.fillStyle = nextColor
+    }
+  }, [color])
 
-  /* ──────────────────  Run Detection loop ─────────────────────── */
+  // Gesture detection with stability
+  const processGesture = useCallback((predictions: HandTrackPrediction[]) => {
+    const now = Date.now()
+    const gestureState = gestureStateRef.current
+    
+    let currentGesture = 'none'
+    let confidence = 0
+    
+    // Find the most confident gesture
+    for (const prediction of predictions) {
+      const score = typeof prediction.score === 'number' ? prediction.score : parseFloat(prediction.score as string)
+      if (score > confidence) {
+        confidence = score
+        currentGesture = prediction.label
+      }
+    }
+    
+    // Require minimum confidence and consistency
+    if (confidence < 0.7) {
+      currentGesture = 'none'
+    }
+    
+    // Gesture stability check
+    if (currentGesture === gestureState.lastGesture) {
+      gestureState.gestureConfidence = Math.min(gestureState.gestureConfidence + 0.1, 1.0)
+    } else {
+      gestureState.gestureConfidence = 0.1
+      gestureState.lastGesture = currentGesture
+      gestureState.gestureStartTime = now
+    }
+    
+    // Only act on stable gestures
+    if (gestureState.gestureConfidence > 0.5 && (now - gestureState.gestureStartTime) > 500) {
+      if (currentGesture === 'open' && gestureState.lastGesture !== 'open_processed') {
+        clearCanvas()
+        gestureState.lastGesture = 'open_processed'
+      } else if (currentGesture === 'closed' && gestureState.lastGesture !== 'closed_processed') {
+        changeColor()
+        gestureState.lastGesture = 'closed_processed'
+      }
+    }
+  }, [clearCanvas, changeColor])
+
+  // Draw line between two points
+  const drawLine = useCallback((from: {x: number, y: number}, to: {x: number, y: number}) => {
+    if (!drawCtxRef.current) return
+    
+    const ctx = drawCtxRef.current
+    ctx.beginPath()
+    ctx.moveTo(from.x, from.y)
+    ctx.lineTo(to.x, to.y)
+    ctx.stroke()
+  }, [])
+
+  // Main detection loop with better stability
   useEffect(() => {
-    if (!model || !videoRef.current || !canvasRef.current || !drawCanvasRef.current) return
+    if (!model || !videoRef.current || !canvasRef.current || !detectionRunning) return
 
     const video = videoRef.current
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
-    const drawC = drawCanvasRef.current
-    const drawctx = drawC.getContext('2d')
-    if (!ctx || !drawctx) return
+    if (!ctx) return
 
-    addLog('Starting detection loop')
-
-    let lastGesture = 'none'
-
+    // Update canvas sizes
     const updateCanvasSize = () => {
-      if (video.videoWidth && video.videoHeight) {
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
         canvas.width = video.videoWidth
         canvas.height = video.videoHeight
-        addLog(`Canvas size: ${video.videoWidth}x${video.videoHeight}`)
+        
+        // Update drawing canvas size to match video aspect ratio
+        if (drawCanvasRef.current) {
+          const container = drawCanvasRef.current.parentElement
+          if (container) {
+            const containerWidth = container.offsetWidth
+            const containerHeight = container.offsetHeight
+            const videoAspect = video.videoWidth / video.videoHeight
+            const containerAspect = containerWidth / containerHeight
+            
+            if (videoAspect > containerAspect) {
+              drawCanvasRef.current.width = containerWidth
+              drawCanvasRef.current.height = containerWidth / videoAspect
+            } else {
+              drawCanvasRef.current.width = containerHeight * videoAspect
+              drawCanvasRef.current.height = containerHeight
+            }
+          }
+        }
       }
-      const { width, height } = drawC.getBoundingClientRect()
-      drawC.width = width
-      drawC.height = height
-      addLog(`Draw canvas size: ${width}x${height}`)
     }
 
     video.addEventListener('loadedmetadata', updateCanvasSize)
-    updateCanvasSize() 
+    updateCanvasSize()
 
-    let detectionCount = 0
-    const timer = setInterval(async () => {
+    let frameCount = 0
+    let lastFpsUpdate = Date.now()
+    let isDetecting = false
+
+    const updateFps = () => {
+      const now = Date.now()
+      if (now - lastFpsUpdate > 1000) {
+        setFps(Math.round(frameCount * 1000 / (now - lastFpsUpdate)))
+        frameCount = 0
+        lastFpsUpdate = now
+      }
+    }
+
+    const detect = async () => {
+      if (isDetecting || video.paused || video.ended) return
+      
+      isDetecting = true
+      
       try {
-        if (video.videoWidth === 0 || video.videoHeight === 0) return
-        if (video.paused || video.ended) return
-
-        const predictions = (await model.detect(video))
-        detectionCount++
-
-        // Log ALL predictions to see what's being detected
-        if (predictions.length > 0) {
-          addLog(`Raw predictions: ${predictions.map(p => `${p.label}(${typeof p.score === 'number' ? p.score.toFixed(2) : p.score})`).join(', ')}`)
-        }
-
-        // Filter out pinch but keep everything else
-        const filtered = predictions.filter(p => p.label !== 'pinch')
-
-        // Log every 10th detection to avoid spam
-        if (detectionCount % 10 === 0) {
-          addLog(`Filtered predictions: ${filtered.map(p => `${p.label}(${typeof p.score === 'number' ? p.score.toFixed(2) : p.score})`).join(', ') || 'none'}`)
-        }
-
-        // Use all filtered predictions instead of just the best one
-        let best: HandTrackPrediction | undefined
-        for (const p of filtered) {
-          const sc = typeof p.score === 'number' ? p.score : parseFloat(p.score)
-          if (!best || sc > (typeof best.score === 'number' ? best.score : +best.score)) {
-            best = p
-          }
-        }
-        const finalPredictions = best ? [best] : []
-
-        // Clear and render predictions
+        const predictions = await model.detect(video)
+        
+        // Clear detection canvas (but NOT the drawing canvas)
         ctx.clearRect(0, 0, canvas.width, canvas.height)
-        if (finalPredictions.length > 0) {
-          model.renderPredictions(finalPredictions, canvas, ctx, video)
-        }
- 
-        /*──────────────────  gesture mapping on the drawing canvas ──────────────────  */
-
-        const point = finalPredictions.find(p => p.label === 'point')
-        const open = finalPredictions.find(p => p.label === 'open')
-        const closed = finalPredictions.find(p => p.label === 'closed')
-        const face = finalPredictions.find(p => p.label === 'face')
-
-        let currentGesture = 'none'
-        if (face) currentGesture = 'face'
-        if (open) currentGesture = 'open'
-        if (closed) currentGesture = 'closed'
-        if (point) currentGesture = 'point'
-
-        // Log gesture changes
-        if (currentGesture !== lastGesture) {
-          addLog(`Gesture changed: ${lastGesture} → ${currentGesture}`)
-          lastGesture = currentGesture
+        
+        // Render predictions on detection canvas
+        if (predictions.length > 0) {
+          model.renderPredictions(predictions, canvas, ctx, video)
         }
 
-        if (face) {
-          // Only log occasionally to avoid spam
-          if (detectionCount % 20 === 0) {
-            addLog('Face detected')
-          }
-        }
-
-        if (open) {
-          drawctx.clearRect(0, 0, drawC.width, drawC.height)
-          resetStroke()
-          addLog('Open hand - clearing canvas')
-        } else if (closed) {
-          const newColor = rndColor()
-          setColor(newColor)
-          resetStroke()
-          addLog(`Closed fist - changing color to ${newColor}`)
-        } else if (point) {
-          const [x, y, w, h] = point.bbox
+        // Process gestures
+        processGesture(predictions)
+        
+        // Handle drawing for point gesture
+        const pointPrediction = predictions.find(p => p.label === 'point')
+        if (pointPrediction && drawCanvasRef.current) {
+          const [x, y, w, h] = pointPrediction.bbox
           const cx = (x + w / 2) / video.videoWidth
           const cy = (y + h / 2) / video.videoHeight
-          const dx = cx * drawC.width
-          const dy = cy * drawC.height
-
-          drawctx.strokeStyle = color
-          drawctx.lineWidth = 4
-          drawctx.lineCap = 'round'
-
-          if (!lastX && !lastY) {
-            setLastX(dx)
-            setLastY(dy)
-          } else {
-            drawctx.beginPath()
-            drawctx.moveTo(lastX, lastY)
-            drawctx.lineTo(dx, dy)
-            drawctx.stroke()
-
-            setLastX(dx)
-            setLastY(dy)
+          const dx = cx * drawCanvasRef.current.width
+          const dy = cy * drawCanvasRef.current.height
+          
+          const currentPoint = { x: dx, y: dy }
+          
+          if (lastPointRef.current) {
+            // Calculate distance to prevent jagged lines
+            const distance = Math.sqrt(
+              Math.pow(currentPoint.x - lastPointRef.current.x, 2) + 
+              Math.pow(currentPoint.y - lastPointRef.current.y, 2)
+            )
+            
+            // Only draw if movement is reasonable (not too big jumps)
+            if (distance < 100 && distance > 2) {
+              drawLine(lastPointRef.current, currentPoint)
+            }
           }
           
-          // Log occasionally
-          if (detectionCount % 20 === 0) {
-            addLog(`Drawing at (${dx.toFixed(0)}, ${dy.toFixed(0)})`)
-          }
+          lastPointRef.current = currentPoint
+          setIsDrawing(true)
         } else {
-          resetStroke()
+          lastPointRef.current = null
+          setIsDrawing(false)
         }
+        
+        frameCount++
+        updateFps()
       } catch (err) {
         console.error('Detection error:', err)
-        addLog(`Detection error: ${err instanceof Error ? err.message : 'Unknown error'}`)
-        
-        // If there's an error, try to restart the detection
-        if (err instanceof Error && err.message.includes('canvas')) {
-          addLog('Canvas error detected - attempting to recover')
-          // Don't break the loop, just skip this iteration
-          return
-        }
+      } finally {
+        isDetecting = false
       }
-    }, 150)
-    
+    }
+
+    // Use recursive timeout instead of interval for better control
+    const scheduleDetection = () => {
+      if (detectionRunning) {
+        detect().finally(() => {
+          detectionTimeoutRef.current = setTimeout(scheduleDetection, 100) // 10fps
+        })
+      }
+    }
+
+    scheduleDetection()
+
     return () => {
-      clearInterval(timer)
-      const stream = video.srcObject as MediaStream | null
-      if (stream) {
-        stream.getTracks().forEach(t => t.stop())
+      if (detectionTimeoutRef.current) {
+        clearTimeout(detectionTimeoutRef.current)
       }
       video.removeEventListener('loadedmetadata', updateCanvasSize)
-      addLog('Detection loop stopped')
     }
-  }, [model, color, lastX, lastY])
+  }, [model, detectionRunning, processGesture, drawLine])
 
   return (
-    <div className="flex h-screen">
+    <div className="flex flex-col md:flex-row h-screen bg-gray-900 text-white">
       {/* Drawing Canvas */}
-      <div className="relative w-1/2 bg-gray-100">
-        <canvas 
-          ref={drawCanvasRef} 
-          className="absolute inset-0 w-full h-full border-2 border-gray-300" 
-        />
-        <div className="absolute bottom-4 left-4 text-sm text-gray-600 bg-white px-2 py-1 rounded">
-          Current Color: <span style={{color: color}}>●</span>
-        </div>
-        <div className="absolute top-4 left-4 text-sm text-gray-600 bg-white px-2 py-1 rounded">
-          Point: Draw | Open: Clear | Closed: Change Color
-        </div>
-        
-        {/* Tips for better detection */}
-        <div className="absolute bottom-16 left-4 text-sm text-gray-600 bg-white px-2 py-1 rounded max-w-xs">
-          <div className="font-bold">Tips:</div>
-          <div>• Hold hand 1-2 feet from camera</div>
-          <div>• Ensure good lighting</div>
-          <div>• Make clear, distinct gestures</div>
-          <div>• Point finger should be extended</div>
-        </div>
-        
-        {/* Debug log */}
-        <div className="absolute bottom-4 right-4 w-80 max-h-40 overflow-y-auto bg-black bg-opacity-80 text-green-400 text-xs p-2 rounded font-mono">
-          <div className="font-bold mb-1">Debug Log:</div>
-          {detectionLog.map((log, i) => (
-            <div key={i}>{log}</div>
-          ))}
+      <div className="relative w-full md:w-1/2 bg-gray-800">
+        <div className="absolute inset-0 flex flex-col">
+          <div className="p-4 bg-gray-900 bg-opacity-80 flex justify-between items-center">
+            <div>
+              <h1 className="text-xl font-bold">Hand Tracking Drawing</h1>
+              <p className="text-sm text-gray-400">Point: Draw | Open Hand: Clear | Fist: Change Color</p>
+            </div>
+            <div className="flex items-center space-x-4">
+              <div className="flex items-center">
+                <span className="mr-2">Color:</span>
+                <div 
+                  className="w-8 h-8 rounded-full border-2 border-white" 
+                  style={{ backgroundColor: color }}
+                />
+              </div>
+              <div className="flex items-center">
+                <span className="mr-2">Drawing:</span>
+                <div className={`w-3 h-3 rounded-full ${isDrawing ? 'bg-green-500' : 'bg-gray-500'}`} />
+              </div>
+              <button 
+                onClick={clearCanvas}
+                className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm"
+              >
+                Clear Canvas
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 flex items-center justify-center">
+            <canvas 
+              ref={drawCanvasRef} 
+              className="bg-gray-900 border border-gray-700 max-w-full max-h-full"
+              style={{ width: '100%', height: '100%' }}
+            />
+          </div>
         </div>
       </div>
 
       {/* Video Feed */}
-      <div className="relative w-1/2 bg-black">
+      <div className="relative w-full md:w-1/2 bg-black">
         {error && (
           <div className="absolute top-4 left-4 z-10 bg-red-500 text-white px-4 py-2 rounded max-w-xs">
             {error}
-            <button 
-              onClick={restartCamera}
-              className="ml-2 px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-xs"
-            >
-              Restart Camera
-            </button>
           </div>
         )}
         
@@ -388,26 +427,23 @@ export default function HandTrackDemo() {
         )}
 
         {/* Status indicators */}
-        <div className="absolute top-16 right-4 z-10 bg-black bg-opacity-70 text-white px-3 py-2 rounded text-sm">
-          <div>HandTrack: {handTrackLoaded ? '✅' : '❌'}</div>
+        <div className="absolute top-4 right-4 z-10 bg-black bg-opacity-70 text-white px-3 py-2 rounded text-sm">
+          <div className="flex items-center">
+            <span className={`w-3 h-3 rounded-full mr-2 ${detectionRunning ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`}></span>
+            <span>FPS: {fps}</span>
+          </div>
           <div>Camera: {cameraStatus}</div>
-          <div>Model: {model ? '✅' : '❌'}</div>
+          <div>Model: {model ? 'Loaded' : 'Not Loaded'}</div>
         </div>
 
         {/* Camera controls */}
-        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-10 bg-black bg-opacity-50 text-white px-4 py-2 rounded">
+        <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-10">
           <button 
             onClick={start}
             disabled={isLoading || !handTrackLoaded}
-            className="mr-2 px-3 py-1 bg-green-600 hover:bg-green-500 disabled:bg-gray-600 rounded text-sm"
+            className="px-4 py-2 bg-green-600 hover:bg-green-500 disabled:bg-gray-600 rounded text-sm"
           >
             {isLoading ? 'Starting...' : 'Start Camera'}
-          </button>
-          <button 
-            onClick={restartCamera}
-            className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm"
-          >
-            Restart Camera
           </button>
         </div>
 
@@ -422,6 +458,12 @@ export default function HandTrackDemo() {
           ref={canvasRef}
           className="absolute inset-0 h-full w-full pointer-events-none"
         />
+        
+        {/* Instructions */}
+        <div className="absolute bottom-4 left-4 right-4 bg-black bg-opacity-70 text-white p-3 rounded text-sm">
+          <h3 className="font-bold mb-1">How to use:</h3>
+          
+        </div>
       </div>
     </div>
   )
